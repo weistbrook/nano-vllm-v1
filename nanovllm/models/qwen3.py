@@ -124,6 +124,7 @@ class Qwen3DecoderLayer(nn.Module):
         self,
         config: Qwen3Config,
         use_triton: bool = False,
+        use_triton_hidden_rmsnorm: bool = False,
     ) -> None:
         super().__init__()
         self.self_attn = Qwen3Attention(
@@ -144,8 +145,16 @@ class Qwen3DecoderLayer(nn.Module):
             hidden_act=config.hidden_act,
             use_triton=use_triton,
         )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, use_triton=use_triton)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, use_triton=use_triton)
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            use_triton=use_triton_hidden_rmsnorm,
+        )
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            use_triton=use_triton_hidden_rmsnorm,
+        )
 
     def forward(
         self,
@@ -169,11 +178,23 @@ class Qwen3Model(nn.Module):
         self,
         config: Qwen3Config,
         use_triton: bool = False,
+        use_triton_hidden_rmsnorm: bool = False,
     ) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([Qwen3DecoderLayer(config, use_triton=use_triton) for _ in range(config.num_hidden_layers)])
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, use_triton=use_triton)
+        self.layers = nn.ModuleList([
+            Qwen3DecoderLayer(
+                config,
+                use_triton=use_triton,
+                use_triton_hidden_rmsnorm=use_triton_hidden_rmsnorm,
+            )
+            for _ in range(config.num_hidden_layers)
+        ])
+        self.norm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            use_triton=use_triton_hidden_rmsnorm,
+        )
 
     def forward(
         self,
@@ -201,9 +222,14 @@ class Qwen3ForCausalLM(nn.Module):
         self,
         config: Qwen3Config,
         use_triton: bool = False,
+        use_triton_hidden_rmsnorm: bool = False,
     ) -> None:
         super().__init__()
-        self.model = Qwen3Model(config, use_triton=use_triton)
+        self.model = Qwen3Model(
+            config,
+            use_triton=use_triton,
+            use_triton_hidden_rmsnorm=use_triton_hidden_rmsnorm,
+        )
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data

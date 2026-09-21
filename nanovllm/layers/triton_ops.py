@@ -16,14 +16,14 @@ def _rms_norm_fwd_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     row = tl.program_id(0)
-    base = row * N
+    base = row * N  # 第 row 行的起始偏移
     var = 0.0
     for off in range(0, N, BLOCK_SIZE):
         cols = off + tl.arange(0, BLOCK_SIZE)
         mask = cols < N
         x = tl.load(x_ptr + base + cols, mask=mask, other=0.0).to(tl.float32)
-        var += tl.sum(x * x, axis=0)
-    rstd = tl.rsqrt(var / N + eps)
+        var += tl.sum(x * x, axis=0)   # 求出每一行的方差
+    rstd = tl.rsqrt(var / N + eps)   # 计算每一行的标准差的倒数
     for off in range(0, N, BLOCK_SIZE):
         cols = off + tl.arange(0, BLOCK_SIZE)
         mask = cols < N
@@ -84,7 +84,8 @@ def _silu_and_mul_kernel(
 
 
 def _launch_config(n: int) -> tuple[int, int]:
-    block_size = min(triton.next_power_of_2(n), MAX_BLOCK_SIZE)
+    #block_size = min(triton.next_power_of_2(n), MAX_BLOCK_SIZE)
+    block_size = min(512, triton.next_power_of_2(n))
     num_warps = 8 if block_size >= MAX_BLOCK_SIZE else 4
     return block_size, num_warps
 

@@ -1,33 +1,37 @@
 """Operator-level benchmark: eager PyTorch vs torch.compile vs Triton.
 
-This isolates the three ops that --use-triton replaces (RMSNorm, Add+RMSNorm,
-SiluAndMul) so you can see the kernel-level cost instead of end-to-end
-throughput. Shapes are derived from the model config; `--tokens` is the number
-of tokens in a batch (decode batch size, or chunked-prefill chunk size).
+Uses triton.testing.perf_report + triton.testing.Benchmark so plots and an
+HTML report are generated automatically (open the generated .html under
+--out-dir, or view inline when running inside a notebook).
+
+Timing uses triton.testing.do_bench (loop mode) which flushes the L2 cache
+between iterations. This matters a lot on consumer GPUs such as the RTX 5060
+Ti (roughly 448 GB/s specification peak): a naive back-to-back loop keeps
+re-reading the same tensors from L2 and the "GB/s" figure can be several times
+the real HBM bandwidth. The utilization report uses minimum logical tensor
+traffic and a measured copy-bandwidth baseline by default.
 
 Examples:
-  # decode-sized batches (1 token per sequence)
-  python bench_ops.py --model ~/models/Qwen3-4B --tokens 1,16,64,128,256
-
-  # prefill-sized chunks
-  python bench_ops.py --model ~/models/Qwen3-4B --tokens 1024,2048
-
-  # include launch latency (no CUDA graph) instead of pure kernel time
   python bench_ops.py --model ~/models/Qwen3-4B --mode loop
+  python bench_ops.py --model ~/models/Qwen3-4B --mode graph
+  python bench_ops.py --model ~/models/Qwen3-4B --no-show
 """
 
 import argparse
 import os
-import statistics
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.testing
 from transformers import AutoConfig
 
 from nanovllm.layers import triton_ops
 
 
-def load_dims(model: str):
+# -------------------------------------------------------------- model dims --
+
+def load_dims(model):
     cfg = AutoConfig.from_pretrained(model)
     hidden = cfg.hidden_size
     inter = cfg.intermediate_size
@@ -38,8 +42,7 @@ def load_dims(model: str):
     return hidden, inter, n_heads, n_kv_heads, head_dim, cfg.torch_dtype, eps
 
 
-# --- torch references: identical math to the @torch.compile methods in the
-# --- repo's RMSNorm / SiluAndMul, so eager and compiled differ only by fusion.
+# -------------------------------------------------------- reference ops ----
 
 def rms_torch(x, w, eps):
     orig = x.dtype
@@ -68,82 +71,231 @@ ADD_RMS_COMPILED = torch.compile(add_rms_torch)
 SILU_COMPILED = torch.compile(silu_torch)
 
 
-# ---------------------------------------------------------------- timing ----
+# ----------------------------------------------------------- timing helper --
 
-def _measure_fallback(fn, reps, trials):
-    times = []
-    for _ in range(trials):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(reps):
-            fn()
-        end.record()
-        torch.cuda.synchronize()
-        times.append(start.elapsed_time(end) / reps * 1000.0)
-    return statistics.median(times)
+def _do_bench(fn, mode):
+    """Return median per-call time in microseconds.
 
-
-def measure(fn, warmup, reps, trials, use_graph):
-    """Median per-call time in microseconds.
-
-    With use_graph=True the op is captured `reps` times inside one CUDA graph
-    and the graph is replayed `reps` times, so launch overhead is removed and
-    the number is pure GPU kernel time (what the decode CUDA-graph path sees).
-    Otherwise a plain back-to-back loop is timed, which includes launch latency.
+    mode == "loop"  -> triton.testing.do_bench, flushes a 256 MB buffer before
+                       every timed iteration. Real HBM traffic.
+    mode == "graph" -> triton.testing.do_bench_cudagraph, captures the op into
+                       a CUDA graph and replays it. Launch overhead removed,
+                       but L2 is not flushed inside the graph.
     """
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-
-    if use_graph:
+    if mode == "graph":
         try:
-            graph = torch.cuda.CUDAGraph()
-            side = torch.cuda.Stream()
-            side.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(side):
-                for _ in range(3):
-                    fn()
-            torch.cuda.current_stream().wait_stream(side)
-            torch.cuda.synchronize()
-            with torch.cuda.graph(graph):
-                for _ in range(reps):
-                    fn()
-            torch.cuda.synchronize()
-            times = []
-            for _ in range(trials):
-                start = torch.cuda.Event(enable_timing=True)
-                end = torch.cuda.Event(enable_timing=True)
-                start.record()
-                for _ in range(reps):
-                    graph.replay()
-                end.record()
-                torch.cuda.synchronize()
-                times.append(start.elapsed_time(end) / (reps * reps) * 1000.0)
-            del graph
-            return statistics.median(times)
-        except Exception as exc:  # capture can fail (e.g. compiled graph breaks)
-            print(f"    [graph capture failed, falling back to loop: {exc}]")
-
-    return _measure_fallback(fn, reps, trials)
+            from triton.testing import do_bench_cudagraph
+            return do_bench_cudagraph(fn, rep=100) * 1000.0
+        except Exception:
+            pass
+    from triton.testing import do_bench
+    return do_bench(fn, warmup=25, rep=100) * 1000.0
 
 
-# ------------------------------------------------------------ op builders ----
+def _measure_peak_bandwidth(device):
+    """Measure a copy bandwidth baseline in GB/s on the selected device."""
+    size = 256 * 1024 * 1024
+    source = torch.empty(size, dtype=torch.uint8, device=device)
+    target = torch.empty_like(source)
+    elapsed_ms = triton.testing.do_bench(
+        lambda: target.copy_(source), warmup=25, rep=100)
+    return 2 * source.numel() / (elapsed_ms * 1e-3) / 1e9
+
+
+# ------------------------------------------------------- report builders ----
+
+X_VALS = [1, 16, 64, 128, 256, 512, 1024, 2048]
+
+
+def _bench_kwargs(plot_name, ylabel="time (us)"):
+    return dict(
+        x_names=["T"],
+        x_vals=X_VALS,
+        x_log=True,
+        line_arg="backend",
+        line_vals=["eager", "compile", "triton"],
+        line_names=["eager", "torch.compile", "triton"],
+        styles=[("gray", "-"), ("tab:blue", "-"), ("tab:red", "-")],
+        ylabel=ylabel,
+        plot_name=plot_name,
+        args={},
+    )
+
+
+def _effective_bandwidth_gbps(byte_count, elapsed_us):
+    return byte_count / (elapsed_us * 1e-6) / 1e9
+
+
+def _bandwidth_report_kwargs(plot_name):
+    return _bench_kwargs(plot_name, "bandwidth utilization (% of peak)")
+
+
+def build_bandwidth_reports(dims, device, dtype, mode, peak_bandwidth):
+    """Return reports for logical bandwidth and peak-bandwidth utilization."""
+    hidden, inter, n_heads, n_kv_heads, head_dim, eps = dims
+    itemsize = torch.empty((), dtype=dtype).element_size()
+    reports = []
+
+    def make_report(plot_name, traffic_bytes, make_fn):
+        @triton.testing.perf_report(
+            triton.testing.Benchmark(**_bandwidth_report_kwargs(plot_name)))
+        def report(T, backend):
+            fn = make_fn(T, backend)
+            elapsed_us = _do_bench(fn, mode)
+            bandwidth_gbps = _effective_bandwidth_gbps(
+                traffic_bytes(T), elapsed_us)
+            return 100.0 * bandwidth_gbps / peak_bandwidth
+        return report
+
+    def add_rms_fn(T, backend):
+        x = torch.randn(T, hidden, device=device, dtype=dtype)
+        r = torch.randn(T, hidden, device=device, dtype=dtype)
+        w = torch.randn(hidden, device=device, dtype=dtype)
+        if backend == "eager":
+            return lambda: add_rms_torch(x, r, w, eps)
+        if backend == "compile":
+            return lambda: ADD_RMS_COMPILED(x, r, w, eps)
+        return lambda: triton_ops.add_rms_norm(x, r, w, eps)
+
+    reports.append(make_report(
+        "add_rms_norm(hidden) bandwidth",
+        lambda T: 4 * T * hidden * itemsize,
+        add_rms_fn,
+    ))
+
+    def rms_hidden_fn(T, backend):
+        x = torch.randn(T, hidden, device=device, dtype=dtype)
+        w = torch.randn(hidden, device=device, dtype=dtype)
+        if backend == "eager":
+            return lambda: rms_torch(x, w, eps)
+        if backend == "compile":
+            return lambda: RMS_COMPILED(x, w, eps)
+        return lambda: triton_ops.rms_norm(x, w, eps)
+
+    reports.append(make_report(
+        "rms_norm(hidden) bandwidth",
+        lambda T: 2 * T * hidden * itemsize,
+        rms_hidden_fn,
+    ))
+
+    def rms_head_fn(T, backend):
+        rows_q = T * n_heads
+        rows_k = T * n_kv_heads
+        xq = torch.randn(rows_q, head_dim, device=device, dtype=dtype)
+        xk = torch.randn(rows_k, head_dim, device=device, dtype=dtype)
+        wq = torch.randn(head_dim, device=device, dtype=dtype)
+        if backend == "eager":
+            return lambda: (rms_torch(xq, wq, eps), rms_torch(xk, wq, eps))
+        if backend == "compile":
+            return lambda: (RMS_COMPILED(xq, wq, eps),
+                            RMS_COMPILED(xk, wq, eps))
+        return lambda: (triton_ops.rms_norm(xq, wq, eps),
+                        triton_ops.rms_norm(xk, wq, eps))
+
+    reports.append(make_report(
+        "rms_norm(head_dim) q+k bandwidth",
+        lambda T: 4 * T * (n_heads + n_kv_heads) * head_dim * itemsize,
+        rms_head_fn,
+    ))
+
+    def silu_fn(T, backend):
+        g = torch.randn(T, 2 * inter, device=device, dtype=dtype)
+        if backend == "eager":
+            return lambda: silu_torch(g)
+        if backend == "compile":
+            return lambda: SILU_COMPILED(g)
+        return lambda: triton_ops.silu_and_mul(g)
+
+    reports.append(make_report(
+        "silu_and_mul bandwidth",
+        lambda T: 3 * T * inter * itemsize,
+        silu_fn,
+    ))
+
+    return reports
+
+
+def build_reports(dims, device, dtype, mode):
+    """Return a list of perf_report-decorated functions, one per op."""
+    hidden, inter, n_heads, n_kv_heads, head_dim, eps = dims
+    reports = []
+
+    # ---- add_rms_norm(hidden) ----
+    @triton.testing.perf_report(
+        triton.testing.Benchmark(**_bench_kwargs("add_rms_norm(hidden)")))
+    def bench_add_rms(T, backend):
+        x = torch.randn(T, hidden, device=device, dtype=dtype)
+        r = torch.randn(T, hidden, device=device, dtype=dtype)
+        w = torch.randn(hidden, device=device, dtype=dtype)
+        if backend == "eager":
+            fn = lambda: add_rms_torch(x, r, w, eps)
+        elif backend == "compile":
+            fn = lambda: ADD_RMS_COMPILED(x, r, w, eps)
+        else:
+            fn = lambda: triton_ops.add_rms_norm(x, r, w, eps)
+        return _do_bench(fn, mode)
+    reports.append(bench_add_rms)
+
+    # ---- rms_norm(hidden) ----
+    @triton.testing.perf_report(
+        triton.testing.Benchmark(**_bench_kwargs("rms_norm(hidden)")))
+    def bench_rms_hidden(T, backend):
+        x = torch.randn(T, hidden, device=device, dtype=dtype)
+        w = torch.randn(hidden, device=device, dtype=dtype)
+        if backend == "eager":
+            fn = lambda: rms_torch(x, w, eps)
+        elif backend == "compile":
+            fn = lambda: RMS_COMPILED(x, w, eps)
+        else:
+            fn = lambda: triton_ops.rms_norm(x, w, eps)
+        return _do_bench(fn, mode)
+    reports.append(bench_rms_hidden)
+
+    # ---- rms_norm(head_dim) q+k ----
+    @triton.testing.perf_report(
+        triton.testing.Benchmark(**_bench_kwargs("rms_norm(head_dim) q+k")))
+    def bench_rms_head(T, backend):
+        rows_q = T * n_heads
+        rows_k = T * n_kv_heads
+        xq = torch.randn(rows_q, head_dim, device=device, dtype=dtype)
+        xk = torch.randn(rows_k, head_dim, device=device, dtype=dtype)
+        wq = torch.randn(head_dim, device=device, dtype=dtype)
+        if backend == "eager":
+            fn = lambda: (rms_torch(xq, wq, eps), rms_torch(xk, wq, eps))
+        elif backend == "compile":
+            fn = lambda: (RMS_COMPILED(xq, wq, eps),
+                          RMS_COMPILED(xk, wq, eps))
+        else:
+            fn = lambda: (triton_ops.rms_norm(xq, wq, eps),
+                          triton_ops.rms_norm(xk, wq, eps))
+        return _do_bench(fn, mode)
+    reports.append(bench_rms_head)
+
+    # ---- silu_and_mul ----
+    @triton.testing.perf_report(
+        triton.testing.Benchmark(**_bench_kwargs("silu_and_mul")))
+    def bench_silu(T, backend):
+        g = torch.randn(T, 2 * inter, device=device, dtype=dtype)
+        if backend == "eager":
+            fn = lambda: silu_torch(g)
+        elif backend == "compile":
+            fn = lambda: SILU_COMPILED(g)
+        else:
+            fn = lambda: triton_ops.silu_and_mul(g)
+        return _do_bench(fn, mode)
+    reports.append(bench_silu)
+
+    return reports
+
+
+# ------------------------------------------------------------ correctness ----
 
 def _as_tuple(v):
     return v if isinstance(v, tuple) else (v,)
 
 
 def _rel_diff(a, b):
-    """Max abs difference normalised by the max abs value of the reference.
-
-    bf16 kernels legitimately differ by a few ULP depending on whether the
-    weight multiply happens before or after the downcast, so an absolute
-    tolerance produces false alarms. A real bug (wrong normalisation, etc.)
-    shows up as a relative error near or above 1.
-    """
-    diff = 0.0
-    scale = 1e-6
+    diff, scale = 0.0, 1e-6
     for x, y in zip(_as_tuple(a), _as_tuple(b)):
         xf, yf = x.float(), y.float()
         diff = max(diff, (xf - yf).abs().max().item())
@@ -151,123 +303,106 @@ def _rel_diff(a, b):
     return diff / scale
 
 
-def _reps_for(numel, cap):
-    # keep the captured allocation bounded (~64 MB of output per variant)
-    return max(2, min(cap, int(32_000_000 // max(numel, 1))))
-
-
-def build_cases(tokens, dims, device, dtype, reps_cap):
+def check_correctness(dims, device, dtype, T=64):
     hidden, inter, n_heads, n_kv_heads, head_dim, eps = dims
-    cases = []
 
-    def add_case(name, shape, eager, compile_fn, triton, ref, move_bytes, numel):
-        cases.append(dict(name=name, shape=shape, eager=eager, compile=compile_fn,
-                          triton=triton, ref=ref, move_bytes=move_bytes,
-                          reps=_reps_for(numel, reps_cap)))
-
-    T = tokens
-    # Add + RMSNorm over the hidden dim (input_layernorm / post_attention_layernorm)
     x = torch.randn(T, hidden, device=device, dtype=dtype)
     r = torch.randn(T, hidden, device=device, dtype=dtype)
     w = torch.randn(hidden, device=device, dtype=dtype)
-    add_case("add_rms_norm(hidden)",
-             f"{T}x{hidden}",
-             lambda: add_rms_torch(x, r, w, eps),
-             lambda: ADD_RMS_COMPILED(x, r, w, eps),
-             lambda: triton_ops.add_rms_norm(x, r, w, eps),
-             lambda: add_rms_torch(x, r, w, eps),
-             4 * T * hidden * dtype.itemsize, T * hidden)
+    d = _rel_diff(add_rms_torch(x, r, w, eps),
+                  triton_ops.add_rms_norm(x, r, w, eps))
+    print(f"add_rms_norm(hidden)      rel_diff = {d:.3g}  "
+          f"[{'ok' if d <= 0.05 else 'MISMATCH'}]")
 
-    # Plain RMSNorm over the hidden dim (final norm)
     x2 = torch.randn(T, hidden, device=device, dtype=dtype)
-    add_case("rms_norm(hidden)",
-             f"{T}x{hidden}",
-             lambda: rms_torch(x2, w, eps),
-             lambda: RMS_COMPILED(x2, w, eps),
-             lambda: triton_ops.rms_norm(x2, w, eps),
-             lambda: rms_torch(x2, w, eps),
-             2 * T * hidden * dtype.itemsize, T * hidden)
+    d = _rel_diff(rms_torch(x2, w, eps), triton_ops.rms_norm(x2, w, eps))
+    print(f"rms_norm(hidden)          rel_diff = {d:.3g}  "
+          f"[{'ok' if d <= 0.05 else 'MISMATCH'}]")
 
-    # Plain RMSNorm over head_dim (q_norm / k_norm, applied per head)
-    rows_q = T * n_heads
-    rows_k = T * n_kv_heads
+    rows_q, rows_k = T * n_heads, T * n_kv_heads
     xq = torch.randn(rows_q, head_dim, device=device, dtype=dtype)
     xk = torch.randn(rows_k, head_dim, device=device, dtype=dtype)
     wq = torch.randn(head_dim, device=device, dtype=dtype)
-    add_case("rms_norm(head_dim) q+k",
-             f"{rows_q + rows_k}x{head_dim}",
-             lambda: (rms_torch(xq, wq, eps), rms_torch(xk, wq, eps)),
-             lambda: (RMS_COMPILED(xq, wq, eps), RMS_COMPILED(xk, wq, eps)),
-             lambda: (triton_ops.rms_norm(xq, wq, eps), triton_ops.rms_norm(xk, wq, eps)),
-             lambda: (rms_torch(xq, wq, eps), rms_torch(xk, wq, eps)),
-             4 * (rows_q + rows_k) * head_dim * dtype.itemsize,
-             (rows_q + rows_k) * head_dim)
+    d = _rel_diff((rms_torch(xq, wq, eps), rms_torch(xk, wq, eps)),
+                  (triton_ops.rms_norm(xq, wq, eps),
+                   triton_ops.rms_norm(xk, wq, eps)))
+    print(f"rms_norm(head_dim) q+k    rel_diff = {d:.3g}  "
+          f"[{'ok' if d <= 0.05 else 'MISMATCH'}]")
 
-    # SiluAndMul over the gate/up projection output
     g = torch.randn(T, 2 * inter, device=device, dtype=dtype)
-    add_case("silu_and_mul",
-             f"{T}x{2 * inter}",
-             lambda: silu_torch(g),
-             lambda: SILU_COMPILED(g),
-             lambda: triton_ops.silu_and_mul(g),
-             lambda: silu_torch(g),
-             3 * T * inter * dtype.itemsize, T * inter)
+    d = _rel_diff(silu_torch(g), triton_ops.silu_and_mul(g))
+    print(f"silu_and_mul              rel_diff = {d:.3g}  "
+          f"[{'ok' if d <= 0.05 else 'MISMATCH'}]")
 
-    return cases
 
+# ------------------------------------------------------------------ main ----
 
 def main():
-    parser = argparse.ArgumentParser(description="Operator-level eager/compile/Triton benchmark.")
-    parser.add_argument("--model", type=str, default=os.path.expanduser("~/models/Qwen3-4B"))
-    parser.add_argument("--tokens", type=str, default="1,16,64,128,256,1024,2048",
-                        help="Comma-separated token counts (decode batch size or prefill chunk size).")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", type=str,
+                        default=os.path.expanduser("~/models/Qwen3-4B"))
     parser.add_argument("--dtype", type=str, default=None,
-                        choices=["bfloat16", "float16", "float32"],
-                        help="Default: the model's dtype.")
+                        choices=["bfloat16", "float16", "float32"])
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--warmup", type=int, default=10)
-    parser.add_argument("--reps", type=int, default=20, help="Max in-graph repetitions (capped by size).")
-    parser.add_argument("--trials", type=int, default=7)
-    parser.add_argument("--mode", choices=["graph", "loop", "both"], default="graph",
-                        help="graph: pure kernel time; loop: includes launch latency.")
-    parser.add_argument("--no-check", action="store_true", help="Skip Triton-vs-torch correctness check.")
+    parser.add_argument("--mode", choices=["loop", "graph"], default="loop",
+                        help="loop: do_bench (L2 flushed, recommended). "
+                             "graph: do_bench_cudagraph (launch overhead removed).")
+    parser.add_argument("--peak-bandwidth", type=float, default=None,
+                        help="Override measured copy bandwidth in GB/s. "
+                            "By default it is measured on this run.")
+    parser.add_argument("--no-check", action="store_true")
+    parser.add_argument("--no-show", action="store_true",
+                        help="Save plots but don't try to open them.")
+    parser.add_argument("--out-dir", type=str, default="./bench_ops_plots")
     args = parser.parse_args()
 
-    hidden, inter, n_heads, n_kv_heads, head_dim, model_dtype, eps = load_dims(args.model)
+    hidden, inter, n_heads, n_kv_heads, head_dim, model_dtype, eps = \
+        load_dims(args.model)
     dtype = getattr(torch, args.dtype) if args.dtype else model_dtype
     if dtype is None:
         dtype = torch.bfloat16
-    tokens = [int(t) for t in args.tokens.split(",")]
     dims = (hidden, inter, n_heads, n_kv_heads, head_dim, eps)
 
     print(f"model={args.model}")
     print(f"hidden={hidden} intermediate={inter} heads={n_heads}/{n_kv_heads} "
           f"head_dim={head_dim} eps={eps} dtype={dtype}")
-    print(f"tokens={tokens} mode={args.mode} reps<={args.reps} trials={args.trials}")
+    print(f"mode={args.mode}")
 
-    modes = ["graph", "loop"] if args.mode == "both" else [args.mode]
-    for mode in modes:
-        use_graph = mode == "graph"
-        print(f"\n================ mode: {mode} "
-              f"({'pure kernel time' if use_graph else 'includes launch latency'}) ================")
-        for T in tokens:
-            print(f"\n--- tokens={T} ---")
-            for case in build_cases(T, dims, args.device, dtype, args.reps):
-                label = f"{case['name']:<22} {case['shape']:>16}"
-                if not args.no_check:
-                    diff = _rel_diff(case["ref"](), case["triton"]())
-                    tol = 0.05
-                    flag = "ok" if diff <= tol else f"MISMATCH(rel={diff:.3g})"
-                else:
-                    flag = "skip"
-                t_eager = measure(case["eager"], args.warmup, case["reps"], args.trials, use_graph)
-                t_comp = measure(case["compile"], args.warmup, case["reps"], args.trials, use_graph)
-                t_tri = measure(case["triton"], args.warmup, case["reps"], args.trials, use_graph)
-                bw = case["move_bytes"] / (t_tri * 1e-6) / 1e9 if t_tri > 0 else 0.0
-                print(f"{label}  eager {t_eager:8.2f}us  compile {t_comp:8.2f}us  "
-                      f"triton {t_tri:8.2f}us  tri/comp {t_comp / t_tri:5.2f}x  "
-                      f"tri/ea {t_eager / t_tri:5.2f}x  {bw:7.1f}GB/s  [{flag}]")
-                torch.cuda.empty_cache()
+    if args.peak_bandwidth is None:
+        print("measuring copy bandwidth baseline...")
+        peak_bandwidth = _measure_peak_bandwidth(args.device)
+        peak_source = "measured"
+    else:
+        peak_bandwidth = args.peak_bandwidth
+        peak_source = "manual override"
+    if peak_bandwidth <= 0:
+        parser.error("--peak-bandwidth must be greater than zero")
+    print(f"peak_bandwidth={peak_bandwidth:.1f} GB/s ({peak_source})")
+
+    if not args.no_check:
+        print("\n--- correctness check (T=64) ---")
+        check_correctness(dims, args.device, dtype)
+
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    print(f"\n--- running perf_report (mode={args.mode}) ---")
+    for report in build_reports(dims, args.device, dtype, args.mode):
+        report.run(
+            show_plots=not args.no_show,
+            print_data=True,
+            save_path=args.out_dir,
+        )
+
+    print("\n--- running bandwidth utilization report ---")
+    for report in build_bandwidth_reports(
+            dims, args.device, dtype, args.mode, peak_bandwidth):
+        report.run(
+            show_plots=not args.no_show,
+            print_data=True,
+            save_path=args.out_dir,
+        )
+
+    print(f"\nPlots and HTML saved under: {os.path.abspath(args.out_dir)}")
 
 
 if __name__ == "__main__":

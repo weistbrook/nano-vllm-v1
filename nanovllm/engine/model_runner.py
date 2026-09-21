@@ -28,7 +28,11 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config, use_triton=config.use_triton)
+        self.model = Qwen3ForCausalLM(
+            hf_config,
+            use_triton=config.use_triton,
+            use_triton_hidden_rmsnorm=config.use_triton_hidden_rmsnorm,
+        )
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()

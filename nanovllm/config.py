@@ -18,6 +18,7 @@ class Config:
     num_kvcache_blocks: int = -1
     chunked_prefill: bool = False
     use_triton: bool = False
+    use_triton_hidden_rmsnorm: bool = False
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

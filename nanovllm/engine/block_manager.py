@@ -124,18 +124,10 @@ class BlockManager:
             seq.block_table.append(block_id)
         
         # allocate new_blocks
-        last_cached_block_id = seq.block_table[-1] if seq.block_table else -1
-        h = self.blocks[last_cached_block_id].hash if last_cached_block_id != -1 else -1
         for i in range(seq.num_cached_tokens, seq.num_cached_tokens + seq.num_new_tokens, self.block_size):
-            token_ids = seq[i: min(i + self.block_size, seq.num_cached_tokens + seq.num_new_tokens)]
             block_id = self.free_block_ids[0]
-            block = self._allocate_block(block_id)
-            # Only full blocks are hashed; a chunked-prefill chunk may leave the
-            # last block partial, and hashing it would poison the prefix cache.
-            if len(token_ids) == self.block_size:
-                h = self.compute_hash(token_ids, h)
-                block.update(h, token_ids)
-                self.hash_to_block_id[h] = block_id
+            self._allocate_block(block_id)
+            # Reserved blocks are not cacheable until the runner computes KV.
             seq.block_table.append(block_id)
 
 
@@ -168,28 +160,21 @@ class BlockManager:
         """
         Only for seq in the running queue.
         """
-        for i in range(
-            seq.num_cached_blocks * self.block_size, 
-            seq.num_cached_tokens + seq.num_new_tokens, 
-            self.block_size
-        ):  
-            token_ids = seq[i: min(i + self.block_size, seq.num_cached_tokens + seq.num_new_tokens)]
-            current_block_id = seq.block_table[i // self.block_size] \
-                    if i // self.block_size < len(seq.block_table) else -1
-            if current_block_id != -1:
-                current_block = self.blocks[current_block_id]
-                assert current_block.hash == -1
-            if len(token_ids) % self.block_size == 0:
-                previous_block_id = seq.block_table[i // self.block_size - 1] if i >= self.block_size else -1
-                prefix = self.blocks[previous_block_id].hash if previous_block_id != -1 else -1
-                h = self.compute_hash(token_ids, prefix)
-                if current_block_id == -1:
-                    block_id = self.free_block_ids[0]
-                    current_block = self._allocate_block(block_id)
-                    seq.block_table.append(block_id)
-                current_block.update(h, token_ids)
-                self.hash_to_block_id[h] = current_block.block_id
-            elif current_block_id == -1:
-                    block_id = self.free_block_ids[0]
-                    self._allocate_block(block_id)
-                    seq.block_table.append(block_id)
+        required_blocks = (seq.num_context_tokens + self.block_size - 1) // self.block_size
+        while len(seq.block_table) < required_blocks:
+            block_id = self.free_block_ids[0]
+            self._allocate_block(block_id)
+            seq.block_table.append(block_id)
+
+    def cache_full_blocks(self, seq: Sequence, previous_cached_tokens: int):
+        """Publish only blocks whose KV became complete in the finished step."""
+        for i in range(previous_cached_tokens // self.block_size, seq.num_cached_tokens // self.block_size):
+            block = self.blocks[seq.block_table[i]]
+            assert block.hash == -1
+            token_ids = seq.block(i)
+            assert len(token_ids) == self.block_size
+            prefix = self.blocks[seq.block_table[i - 1]].hash if i else -1
+            assert i == 0 or prefix != -1
+            h = self.compute_hash(token_ids, prefix)
+            block.update(h, token_ids)
+            self.hash_to_block_id[h] = block.block_id

@@ -18,6 +18,8 @@ class ModelRunner:
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
+        # Apply on every TP rank, including workers that unpickle sequences.
+        Sequence.block_size = self.block_size
         self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size
         self.rank = rank

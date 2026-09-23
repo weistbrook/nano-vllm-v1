@@ -34,16 +34,23 @@ class LLMEngine:
         atexit.register(self.exit)
 
     def exit(self):
+        # Benchmarks close each engine explicitly; the atexit hook may run later.
+        if not hasattr(self, "model_runner"):
+            return
+        atexit.unregister(self.exit)
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
             p.join()
 
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams) -> Sequence:
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
+        # Keep a stable handle for per-token timing, including the final token
+        # after postprocess removes a finished sequence from the running queue.
+        return seq
 
     def step(self):
         seqs = self.scheduler.schedule()

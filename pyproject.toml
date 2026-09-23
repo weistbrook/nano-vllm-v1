@@ -19,6 +19,12 @@ dependencies = [
     "xxhash",
 ]
 
+[project.optional-dependencies]
+benchmark = ["numpy", "matplotlib", "pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [project.urls]
 Homepage="https://github.com/GeeeekExplorer/nano-vllm"
 

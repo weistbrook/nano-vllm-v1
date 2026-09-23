@@ -2,3 +2,6 @@ plots/
 plots2/
 .kilo/
 __pycache__/
+.pytest_cache/
+.benchmark-test-deps/
+results/

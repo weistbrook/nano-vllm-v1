@@ -17,6 +17,8 @@
 
 当前模型实现主要面向 **Qwen3**。
 
+新增的 [Scheduler 受控实验说明](benchmarks/README.md) 包含同仓库 `legacy` / `chunked` 对照、逐 token ITL、长 Prompt 干扰测试、长度扫描、预算消融及完整运行命令。`legacy` 是保持相同硬 token budget 的 Prefill/Decode step 互斥模拟，长 Prompt 同样分片，不代表 upstream 无分片实现的原样复现。
+
 ---
 
 ## 项目目标
@@ -73,9 +75,9 @@ max_num_batched_tokens
 
 作为当前 Step 可执行的最大 Token 数量。
 
-调度过程优先处理已经处于 Running 状态的请求，并根据剩余 Token Budget 决定当前 Prefill 可以执行多少 Token。
+`chunked` 模式先为已经完成 Prefill、KV 状态就绪的 Decode 请求各分配 1 token，再处理 Running 中未完成的 Prefill，最后使用剩余预算接收 Waiting 请求。
 
-当启用 Chunked Prefill 时：
+Prefill 根据当前剩余 Token Budget 分片：
 
 ```python
 num_new_tokens = min(num_new_tokens, token_budget)
@@ -133,19 +135,19 @@ running
 
 ### Waiting Queue
 
-存储尚未进入推理流程的新请求。
+存储尚未接纳的新请求，以及被抢占、需要重算上下文的请求。
 
 ### Running Queue
 
 存储已经分配 KV Cache，并正在进行 Prefill 或 Decode 的请求。
 
-当前调度策略优先处理 Running Queue：
+`chunked` 模式在 Running Queue 内也区分优先级：
 
 ```text
-Running Request
+Ready Decode Request (1 token each)
       │
       ▼
-Consume Token Budget
+Running Partial Prefill
       │
       ▼
 Remaining Token Budget
@@ -1001,7 +1003,8 @@ nanovllm/config.py
 | `gpu_memory_utilization`    | KV Cache 可使用的 GPU Memory 比例                   |
 | `tensor_parallel_size`      | Tensor Parallel GPU 数量                        |
 | `kvcache_block_size`        | KV Cache Block Size                           |
-| `chunked_prefill`           | 是否启用 Chunked Prefill                          |
+| `scheduler_mode`           | `chunked`（默认）：Decode 优先混合执行；`legacy`：Prefill 优先、step 互斥；两者均遵守硬 Token Budget |
+| `chunked_prefill`           | 兼容旧参数：True 映射 chunked，False 映射 legacy；与显式 mode 冲突时报错 |
 | `enforce_eager`             | 是否关闭 CUDA Graph                               |
 | `use_triton`                | 是否启用部分 Triton 算子                              |
 | `use_triton_hidden_rmsnorm` | 是否启用 Hidden-size Triton RMSNorm / Add-RMSNorm |

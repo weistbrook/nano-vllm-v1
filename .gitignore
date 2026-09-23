@@ -4,4 +4,4 @@ plots2/
 __pycache__/
 .pytest_cache/
 .benchmark-test-deps/
-results/
+nano_vllm.egg-info/

@@ -1,0 +1,24 @@
+{
+  "config": {
+    "model": "/home/weistbrook/models/Qwen3-4B",
+    "num_decode_requests": 32,
+    "short_prompt_len": 128,
+    "short_output_len": 256,
+    "long_prompt_len": 8192,
+    "long_output_len": 64,
+    "inject_after_tokens": 16,
+    "max_num_batched_tokens": 1024,
+    "max_num_seqs": 64,
+    "tensor_parallel_size": 1,
+    "max_model_len": 8256,
+    "gpu_memory_utilization": 0.9,
+    "temperature": 0.6,
+    "seed": 100,
+    "enforce_eager": true
+  },
+  "mode": "chunked",
+  "run_id": 0,
+  "workload_path": "/home/weistbrook/nano-vllm-v1/results/long_prompt_interference/workloads/run_000.json",
+  "workload_sha256": "69a27d1fe8b2ad7af52964efd51c3234e815912257bffd35433fab37098113e5",
+  "result_path": "/home/weistbrook/nano-vllm-v1/results/long_prompt_interference/chunked_run_000.json"
+}
